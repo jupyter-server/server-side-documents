@@ -1,19 +1,27 @@
-name: Lint API Docs
+name: Lint and Deploy API Docs
 
 on:
   pull_request:
   push:
     branches: [main]
 
-permissions:
-  contents: read
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  lint:
+  lint-and-build:
+    name: Lint and build
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
     env:
       REDOCLY_TELEMETRY: "off"
       REDOCLY_SUPPRESS_NOTIFICATIONS: "true"
+      REDOCLY_CLI_VERSION: "2.72.1"
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -26,4 +34,34 @@ jobs:
           node-version: "22"
 
       - name: Lint OpenAPI file
-        run: npx @redocly/cli@latest lint ssd-execute-openapi.yaml --format=github-actions
+        run: npx --yes "@redocly/cli@${REDOCLY_CLI_VERSION}" lint ssd-execute-openapi.yaml --format=github-actions
+
+      - name: Build static HTML documentation
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: npx --yes "@redocly/cli@${REDOCLY_CLI_VERSION}" build-docs ssd-execute-openapi.yaml -o public/index.html
+
+      - name: Upload Pages artifact
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: ./public
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: lint-and-build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write # publish the artifact to GitHub Pages
+      id-token: write # lets deploy-pages verify the deployment source via OIDC
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
