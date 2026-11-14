@@ -1,0 +1,63 @@
+openapi: 3.1.0
+info:
+  title: server-side documents execution API
+  description: |
+    Server-side cell execution endpoint
+
+    Jupyter Server extension
+
+  version: "0.1"
+  contact:
+    name: Jupyter Project
+    url: https://jupyter.org
+  license:
+    name: BSD-3-Clause
+    url: https://github.com/jupyter-server/server-side-documents/blob/main/LICENSE
+security: []
+servers:
+  - url: /
+tags:
+  - name: executions
+    description: Server-side cell execution (authorization resource `executions`)
+paths:
+  /api/kernels/{kernel_id}/execute:
+    post:
+      summary: Enqueue notebook cells for server-side execution
+      operationId: executeCells
+      parameters:
+        - name: kernel_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [document_id, cells]
+              properties:
+                document_id:
+                  type: string
+                cells:
+                  type: array
+                  items:
+                    type: object
+                    required: [cell_id, source_hash]
+                    properties:
+                      cell_id:
+                        type: string
+                      source_hash:
+                        type: string
+                client_id:
+                  type: string
+                sequence:
+                  type: integer
+                request_id:
+                  type: string
+      responses:
+        "200":
+          description: Cells enqueued. The body is JSON null.
+        "409":
+          description: Source mismatch or session reset.
