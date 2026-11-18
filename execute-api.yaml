@@ -6,6 +6,15 @@ info:
 
     Jupyter Server extension
 
+    Execution model: The client names the notebook room and a batch of cells,
+    each with a hash of the source the user saw. The server reads the code
+    from its own Y (CRDT) document, verifies every hash, and enqueues all
+    cells on the room's single execution queue before responding. A per-room
+    worker runs them one at a time on the room's own kernel client, with
+    stdin disabled. The HTTP call returns once the batch is enqueued.
+    Outputs and execution state are written to the shared document, which is
+    outside this REST API. There is no status, cancel, or result endpoint.
+
   version: "0.1"
   contact:
     name: Jupyter Project
@@ -21,44 +30,226 @@ tags:
     description: Server-side cell execution (authorization resource `executions`)
 paths:
   /api/kernels/{kernel_id}/execute:
+    parameters:
+      - $ref: "#/components/parameters/kernel"
     post:
       summary: Enqueue notebook cells for server-side execution
       operationId: executeCells
-      tags: [executions]
-      parameters:
-        - name: kernel_id
-          in: path
-          required: true
-          schema:
-            type: string
+      description: |
+        Verify and enqueue one or more code cells of a notebook room for
+        execution, atomically and in order.
+
+        All cells are resolved and hash-checked before any state changes. If
+        any cell fails a check, no cell is enqueued and the notebook is left
+        unchanged. Because a whole batch is enqueued at once, "Run All" and
+        "Restart and Run All" cannot interleave with other requests.
+
+        Ordering across requests: HTTP requests may arrive out of order. A
+        client that needs ordering sends `client_id` and a `sequence` that
+        starts at 0 and increases by 1 per request. The server holds a
+        request until all lower sequence numbers for that `client_id` in this
+        room have been handled. A sequence slot is consumed even when the
+        request fails (for example with `source_mismatch`), so the client
+        keeps counting. If a predecessor does not arrive within
+        `YNotebookRoom.execute_sequence_timeout` (default 10 s), the waiting
+        requests fail with `409 session_reset` (`reason: timeout`). Sending
+        `sequence: 0` after higher numbers starts a new sequence and fails any
+        pending waiters for that client with `409 session_reset`
+        (`reason: reset`). Disconnecting the kernel also resets sequences;
+        a kernel restart preserves them. Requests without `sequence` are
+        enqueued immediately in arrival order.
+
+        Authentication is required (Jupyter Server token or cookie).
+      tags:
+        - executions
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              type: object
-              required: [document_id, cells]
-              properties:
-                document_id:
-                  type: string
-                cells:
-                  type: array
-                  items:
-                    type: object
-                    required: [cell_id, source_hash]
-                    properties:
-                      cell_id:
-                        type: string
-                      source_hash:
-                        type: string
-                client_id:
-                  type: string
-                sequence:
-                  type: integer
-                request_id:
-                  type: string
+              $ref: "#/components/schemas/ExecuteRequest"
       responses:
         "200":
-          description: Cells enqueued. The body is JSON null.
+          description: |
+            All cells were verified and enqueued (fire-and-forget). The body
+            is JSON `null`. Execution results appear only in the shared Y
+            document.
+          content:
+            application/json:
+              schema:
+                type: "null"
+              examples:
+                nullBody:
+                  value: null
+        "400":
+          description: |
+            Bad request. Raised when:
+
+              - the body is not valid JSON;
+              - `document_id` is missing or empty;
+              - `cells` is missing, empty, or not a list;
+              - `sequence` is not a non-negative integer, or is present
+                without `client_id`;
+              - `sequence` is lower than the next expected value for this
+                `client_id` (a duplicate or rewind other than `0`);
+              - no room could be created for `document_id`, or the room is
+                not a notebook room;
+              - the room is not connected to a kernel, or its execution
+                worker is not running;
+              - a cell entry has no string `cell_id`, or has no
+                `source_hash`;
+              - a cell is not found in the document, or is not a code cell.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JupyterServerError"
+        "403":
+          description: |
+            Not authenticated, or not authorized for `write` on the
+            `executions` resource.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JupyterServerError"
         "409":
-          description: Source mismatch or session reset.
+          description: |
+            Conflict; nothing was enqueued. Either a cell's source in the
+            document no longer matches `source_hash` (another client edited
+            it after the request was made), or a sequence wait was abandoned
+            and the client should start a new sequence (new `client_id` or
+            `sequence: 0`).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExecuteConflict"
+              examples:
+                sourceMismatch:
+                  value:
+                    error: source_mismatch
+                    cell_id: a1b2c3d4
+        "500":
+          description: |
+            Unhandled server error. From the source, this occurs if the body
+            is valid JSON but not an object, or if an entry in `cells` is a
+            bare string rather than an object.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JupyterServerError"
+components:
+  parameters:
+    kernel:
+      name: kernel_id
+      required: true
+      in: path
+      description: |
+        Kernel ID. Must match the route pattern `[\w-]+`. The handler does not
+        use this value: cells run on the kernel attached to the notebook room
+        by the extension's session manager (`YDocSessionManager`), whatever ID
+        appears in the path.
+      schema:
+        type: string
+        pattern: ^[\w-]+$
+  schemas:
+    ExecuteRequest:
+      description: |-
+        Request body for `POST /api/kernels/{kernel_id}/execute`.
+      type: object
+      required:
+        - document_id
+        - cells
+      properties:
+        document_id:
+          type: string
+          description: |
+            Room ID of the notebook, of the form `<format>:<type>:<file_id>`,
+            for example `json:notebook:<file_id>`. The handler gets or creates
+            the room with this ID; it must be a notebook room.
+          examples:
+            - json:notebook:4b2a3c0e1f8d4e6a9b7c5d3e2f1a0b9c
+        cells:
+          type: array
+          minItems: 1
+          description: |-
+            Code cells to execute, atomically and in this order.
+          items:
+            $ref: "#/components/schemas/CellToExecute"
+        client_id:
+          type: string
+          description: |
+            Identifies the requesting client (for example a browser tab) and
+            scopes `sequence`. Required when `sequence` is present. Sequence
+            state is kept per room.
+        sequence:
+          type: integer
+          minimum: 0
+          description: |
+            Monotonic counter per `client_id`, starting at 0 and increasing by
+            1 per request. Optional; omit for unordered requests. `0` sent
+            after higher values signals a reset.
+        request_id:
+          type: string
+          description: |-
+            Opaque identifier (for example a UUID), used only for logging.
+      examples:
+        - document_id: json:notebook:4b2a3c0e1f8d4e6a9b7c5d3e2f1a0b9c
+          cells:
+            - cell_id: a1b2c3d4
+              source_hash: "2948303296"
+          client_id: 7f3e9c2a-1b4d-4e8f-9a6c-0d5b2e1f3a7c
+          sequence: 0
+          request_id: c0ffee00-0000-4000-8000-000000000001
+    CellToExecute:
+      type: object
+      required:
+        - cell_id
+        - source_hash
+      properties:
+        cell_id:
+          type: string
+          description: |-
+            ID of a code cell in the document (nbformat cell `id`).
+        source_hash:
+          type: string
+          pattern: ^[0-9]+$
+          description: |
+            MurmurHash2 (seed 0) of the UTF-8 encoded cell source as the user
+            saw it, as a decimal string (a 32-bit unsigned value). The value is
+            compared as a string, so a numeric JSON value never matches and
+            yields `409 source_mismatch`.
+    ExecuteConflict:
+      description: |-
+        Body of a `409` response.
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          type: string
+          enum:
+            - source_mismatch
+            - session_reset
+        cell_id:
+          type: string
+          description: |-
+            Present when `error` is `source_mismatch`; the first cell whose hash differed.
+        reason:
+          type: string
+          enum:
+            - timeout
+            - reset
+          description: |
+            Present when `error` is `session_reset`. `timeout`: a predecessor
+            sequence never arrived. `reset`: the client sent `sequence: 0`, or
+            the kernel was disconnected while the request was waiting.
+    JupyterServerError:
+      description: |-
+        Error body written by Jupyter Server's `APIHandler.write_error`.
+      type: object
+      properties:
+        message:
+          type: string
+        reason:
+          type:
+            - string
+            - "null"
